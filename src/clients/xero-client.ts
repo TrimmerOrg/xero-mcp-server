@@ -8,6 +8,7 @@ import {
 } from "xero-node";
 
 import { ensureError } from "../helpers/ensure-error.js";
+import { authContext } from "../perRequestAuth.js";
 
 dotenv.config();
 
@@ -16,7 +17,12 @@ const client_secret = process.env.XERO_CLIENT_SECRET;
 const bearer_token = process.env.XERO_CLIENT_BEARER_TOKEN;
 const grant_type = "client_credentials";
 
-if (!bearer_token && (!client_id || !client_secret)) {
+// Mira fork: in HTTP mode the per-request client is supplied via
+// AsyncLocalStorage (see perRequestAuth.ts), so we don't need env vars
+// at startup. Only enforce the legacy env-var check if neither HTTP mode
+// nor stdio-with-env is configured. MCP_TRANSPORT=http skips the check.
+const isHttpMode = process.env.MCP_TRANSPORT === "http";
+if (!isHttpMode && !bearer_token && (!client_id || !client_secret)) {
   throw Error("Environment Variables not set - please check your .env file");
 }
 
@@ -126,7 +132,7 @@ class CustomConnectionsXeroClient extends MCPXeroClient {
 
   public async getClientCredentialsToken(): Promise<TokenSet> {
     // If XERO_SCOPES is set, use that
-    if (process.env.XERO_SCOPES) {                                                                                                                                                     
+    if (process.env.XERO_SCOPES) {
       try {
         return await this.requestToken(process.env.XERO_SCOPES);
       } catch (envError) {
@@ -220,12 +226,52 @@ class BearerTokenXeroClient extends MCPXeroClient {
   }
 }
 
-export const xeroClient = bearer_token
-  ? new BearerTokenXeroClient({
-      bearerToken: bearer_token,
-    })
-  : new CustomConnectionsXeroClient({
-      clientId: client_id!,
-      clientSecret: client_secret!,
+// Mira fork: legacy env-var-backed singleton. Only used when running in
+// stdio mode against a single org (the upstream Claude Desktop pattern).
+// In HTTP mode this is never reached because the Proxy below returns the
+// per-request client from AsyncLocalStorage first.
+//
+// We lazily build it so HTTP mode can boot even without XERO_CLIENT_ID/
+// SECRET in the environment.
+let _legacyClient: MCPXeroClient | null = null;
+function getLegacyClient(): MCPXeroClient {
+  if (_legacyClient) return _legacyClient;
+  if (bearer_token) {
+    _legacyClient = new BearerTokenXeroClient({ bearerToken: bearer_token });
+  } else if (client_id && client_secret) {
+    _legacyClient = new CustomConnectionsXeroClient({
+      clientId: client_id,
+      clientSecret: client_secret,
       grantType: grant_type,
     });
+  } else {
+    throw new Error(
+      "No per-request auth context and no env-var credentials configured. " +
+        "Either run in HTTP mode with per-request Bearer/xero-tenant-id headers, " +
+        "or set XERO_CLIENT_ID/XERO_CLIENT_SECRET (or XERO_CLIENT_BEARER_TOKEN) for stdio.",
+    );
+  }
+  return _legacyClient;
+}
+
+// Mira fork: Proxy-based singleton that resolves every property access
+// against the per-request client from AsyncLocalStorage (HTTP mode), falling
+// back to the legacy env-var-backed client (stdio mode). This keeps all 52+
+// handler files working without modification — they still write
+// `xeroClient.accountingApi.X(xeroClient.tenantId, ...)` and the Proxy
+// transparently routes that to the right user's client.
+export const xeroClient: MCPXeroClient = new Proxy({} as MCPXeroClient, {
+  get(_target, prop, receiver) {
+    const ctx = authContext.getStore();
+    const target = ctx ? ctx.client : getLegacyClient();
+    const value = Reflect.get(target as object, prop, receiver);
+    // Method calls need to be bound to the underlying instance so `this`
+    // resolves correctly inside xero-node's class methods.
+    return typeof value === "function" ? value.bind(target) : value;
+  },
+  set(_target, prop, value) {
+    const ctx = authContext.getStore();
+    const target = ctx ? ctx.client : getLegacyClient();
+    return Reflect.set(target as object, prop, value);
+  },
+}) as MCPXeroClient;
